@@ -493,7 +493,7 @@ export default function App() {
           } catch (error) {
             console.log("Reset error:", error);
           }
-        }
+        } 
       }
     ]);
   };
@@ -1101,4 +1101,4 @@ const styles = StyleSheet.create({
   modalBtnRow: { flexDirection: 'row', gap: 10, marginTop: 15 },
   modalActionBtn: { flex: 1, padding: 12, borderRadius: 8, alignItems: 'center' },
   filterBadge: { backgroundColor: COLORS.dark, alignSelf: 'center', paddingHorizontal: 12, paddingVertical: 4, borderRadius: 12, marginTop: 10 },
-});
+}); 
