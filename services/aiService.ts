@@ -3,6 +3,7 @@ export interface Transaction {
   type: "income" | "expense";
   category?: string;
   date?: string;
+  startMonth?: string; // "YYYY-MM"
 }
 
 
@@ -35,28 +36,41 @@ export function predictFutureSpending(
   );
 
 
-  // Calculate average spending
+  // Estimate how many months the data actually spans, using startMonth
+  // ("YYYY-MM"). Falls back to 1 month when it's missing so the average
+  // degrades to "total spent so far" instead of dividing by zero.
 
-  const averageSpending =
-    totalExpense / expenses.length;
+  const monthKeys = expenses
+    .map((item) => item.startMonth)
+    .filter((m): m is string => !!m && /^\d{4}-\d{2}$/.test(m));
+
+  const toMonthIndex = (m: string) => {
+    const [year, month] = m.split('-').map(Number);
+    return year * 12 + month;
+  };
+
+  const monthsSpanned = monthKeys.length > 0
+    ? Math.max(...monthKeys.map(toMonthIndex)) - Math.min(...monthKeys.map(toMonthIndex)) + 1
+    : 1;
 
 
+  // Average spending per month, based on the actual time span of the data
+  // (previously this averaged per-transaction and multiplied by 30, which
+  // overstated or understated spending depending on transaction count).
 
-  // Estimate next month spending
-
-  const predictedAmount =
-    averageSpending * 30;
+  const averageMonthlySpending =
+    totalExpense / monthsSpanned;
 
 
 
   return {
 
     prediction:
-      Number(predictedAmount.toFixed(2)),
+      Number(averageMonthlySpending.toFixed(2)),
 
 
     message:
-      `Estimated future spending is RM ${predictedAmount.toFixed(2)} based on previous spending behaviour.`
+      `Estimated future spending is RM ${averageMonthlySpending.toFixed(2)} based on your average monthly spending over the last ${monthsSpanned} month${monthsSpanned > 1 ? 's' : ''}.`
   };
 
 }

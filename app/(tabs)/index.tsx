@@ -1,11 +1,11 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { logoutUser } from "../../services/authService";
 import { auth } from "../../services/firebase";
-import { addTransaction, getTransactions, deleteTransaction} from "../../services/transactionService";
+import { addTransaction, deleteTransaction, updateTransaction } from "../../services/transactionService";
 import { useRouter } from "expo-router";
 import { onSnapshot, collection, getDocs, deleteDoc, doc } from "firebase/firestore";
 import { db } from "../../services/firebase";
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { requestNotificationPermission, scheduleDailyReminder } from "../../services/notificationService";
 import { predictFutureSpending } from "../../services/aiService";
 import * as Notifications from "expo-notifications";
@@ -13,6 +13,7 @@ import {
   Alert,
   Keyboard,
   Modal,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -24,6 +25,10 @@ import {
   View
 } from 'react-native';
 import { Calendar, DateData } from 'react-native-calendars';
+import { MaterialIcons } from '@expo/vector-icons';
+import ReanimatedAnimated, { interpolateColor, useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated';
+import { AnimatedPressable } from '../../components/animated-pressable';
+import { AnimatedProgressBar } from '../../components/animated-progress-bar';
 
 // === CONFIG & COLORS ===
 const COLORS = {
@@ -45,77 +50,165 @@ const MONTH_MAP: Record<string, string> = {
   '07': 'Jul', '08': 'Aug', '09': 'Sep', '10': 'Oct', '11': 'Nov', '12': 'Dec'
 };
 
+const CATEGORIES = [
+  { key: 'food', label: 'Food', emoji: '🍔' },
+  { key: 'transport', label: 'Transport', emoji: '🚗' },
+  { key: 'bills', label: 'Bills', emoji: '🧾' },
+  { key: 'shopping', label: 'Shopping', emoji: '🛍️' },
+  { key: 'entertainment', label: 'Entertainment', emoji: '🎬' },
+  { key: 'health', label: 'Health', emoji: '🏥' },
+  { key: 'education', label: 'Education', emoji: '🎓' },
+  { key: 'salary', label: 'Salary', emoji: '💰' },
+  { key: 'other', label: 'Other', emoji: '📦' },
+] as const;
+
+const DEFAULT_CATEGORY = 'other';
+
+// Consistent depth across cards on both platforms — iOS only reads the shadow*
+// props, Android only reads elevation, so both need to be set every time.
+const CARD_SHADOW = {
+  shadowColor: '#000',
+  shadowOffset: { width: 0, height: 2 },
+  shadowOpacity: 0.06,
+  shadowRadius: 6,
+  elevation: 2,
+} as const;
+
+const getCategoryMeta = (key?: string) =>
+  CATEGORIES.find(c => c.key === key) ?? CATEGORIES.find(c => c.key === DEFAULT_CATEGORY)!;
+
 type Transaction = {
   id: string;
   type: 'income' | 'expense';
   detail: string;
-  amount: string; 
-  date: string; 
-  startMonth?: string; 
+  amount: string;
+  date: string;
+  startMonth?: string;
   isLoan: boolean;
-  totalLoanAmount?: string; 
-  monthsLeft?: string;      
+  totalLoanAmount?: string;
+  monthsLeft?: string;
   isRepeated: boolean;
-  repeatDay?: string; 
-  paidMonths?: string[]; 
+  repeatDay?: string;
+  paidMonths?: string[];
+  category?: string;
 };
 
+// Firestore docs aren't guaranteed to match the Transaction shape (partial writes,
+// legacy data, restores) — normalize them so required fields are never undefined.
+const normalizeTransaction = (raw: any, id: string): Transaction => ({
+  id,
+  type: raw?.type === 'income' ? 'income' : 'expense',
+  detail: typeof raw?.detail === 'string' ? raw.detail : '',
+  amount: typeof raw?.amount === 'string' ? raw.amount : String(raw?.amount ?? '0'),
+  date: typeof raw?.date === 'string' ? raw.date : '',
+  startMonth: typeof raw?.startMonth === 'string' ? raw.startMonth : undefined,
+  isLoan: !!raw?.isLoan,
+  totalLoanAmount: typeof raw?.totalLoanAmount === 'string' ? raw.totalLoanAmount : undefined,
+  monthsLeft: typeof raw?.monthsLeft === 'string' ? raw.monthsLeft : undefined,
+  isRepeated: !!raw?.isRepeated,
+  repeatDay: typeof raw?.repeatDay === 'string' ? raw.repeatDay : undefined,
+  paidMonths: Array.isArray(raw?.paidMonths) ? raw.paidMonths : [],
+  category: typeof raw?.category === 'string' ? raw.category : DEFAULT_CATEGORY,
+});
 
+// Shared by filteredItems, totalDebt, totalLoanBalance, and the list render —
+// was previously reimplemented (and easy to accidentally desync) in all four places.
+const getLoanRemainingBalance = (item: Pick<Transaction, 'totalLoanAmount' | 'amount' | 'paidMonths'>) => {
+  const bigTotal = parseFloat(item.totalLoanAmount || '0');
+  const monthly = parseFloat(item.amount || '0');
+  const paidCount = item.paidMonths?.length || 0;
+  return bigTotal - (paidCount * monthly);
+};
+
+// keyboardType="decimal-pad" only hints at which on-screen keyboard to show —
+// it never blocks a hardware keyboard or paste, and has no effect at all on web
+// (RN Web TextInput is a plain <input>). Strip anything that isn't a valid
+// decimal/integer as the user types instead of relying on the keyboard type.
+const sanitizeDecimalInput = (text: string) => {
+  let cleaned = text.replace(/[^0-9.]/g, '');
+  const firstDot = cleaned.indexOf('.');
+  if (firstDot !== -1) {
+    cleaned = cleaned.slice(0, firstDot + 1) + cleaned.slice(firstDot + 1).replace(/\./g, '');
+  }
+  return cleaned;
+};
+
+const sanitizeIntegerInput = (text: string) => text.replace(/[^0-9]/g, '');
+
+// React Native Web's Alert.alert() only ever shows a plain window.alert() message —
+// it silently ignores the buttons array, so onPress handlers (Confirm/Cancel) never
+// fire on web. That made Logout, Reset, and Delete appear to do nothing in a browser.
+const confirmAction = (title: string, message: string, onConfirm: () => void) => {
+  if (Platform.OS === 'web') {
+    if (typeof window !== 'undefined' && window.confirm(`${title}\n\n${message}`)) {
+      onConfirm();
+    }
+    return;
+  }
+
+  Alert.alert(title, message, [
+    { text: "Cancel", style: "cancel" },
+    { text: "Confirm", style: "destructive", onPress: onConfirm },
+  ]);
+};
+
+// Smooth color crossfade between active/inactive tab states instead of an
+// abrupt background swap — kept intentionally simple (color-only, no layout
+// measurement) to stay reliable across platforms.
+function AnimatedTabButton({ label, active, onPress }: { label: string; active: boolean; onPress: () => void }) {
+  const progress = useSharedValue(active ? 1 : 0);
+
+  useEffect(() => {
+    progress.value = withTiming(active ? 1 : 0, { duration: 200 });
+  }, [active, progress]);
+
+  const animatedTabStyle = useAnimatedStyle(() => ({
+    backgroundColor: interpolateColor(progress.value, [0, 1], ['transparent', COLORS.dark]),
+  }));
+
+  const animatedTextStyle = useAnimatedStyle(() => ({
+    color: interpolateColor(progress.value, [0, 1], [COLORS.gray, COLORS.white]),
+  }));
+
+  return (
+    <AnimatedPressable onPress={onPress} style={[styles.tab, animatedTabStyle]} scaleTo={0.94}>
+      <ReanimatedAnimated.Text style={[styles.tabText, animatedTextStyle]}>{label}</ReanimatedAnimated.Text>
+    </AnimatedPressable>
+  );
+}
 
 export default function App() {
-  useEffect(() => {
-    const init = async () => {
-      const granted = await requestNotificationPermission();
-      if (granted) {
-      
-      }
-    };
-
-    init();
-  }, []);
-
   const handleDelete = (item: Transaction) => {
-    Alert.alert(
+    confirmAction(
       "Delete Transaction",
       `Are you sure you want to delete "${item.detail}"?`,
-      [
-        {
-          text: "Cancel",
-          style: "cancel",
-        },
-        {
-          text: "Delete",
-          style: "destructive",
-          onPress: async () => {
-            try {
-              const uid = auth.currentUser?.uid;
+      async () => {
+        try {
+          const uid = auth.currentUser?.uid;
 
-              if (!uid) {
-                Alert.alert(
-                  "Delete Failed",
-                  "You are not logged in. Please log in again."
-                );
-                return;
-              }
+          if (!uid) {
+            Alert.alert(
+              "Delete Failed",
+              "You are not logged in. Please log in again."
+            );
+            return;
+          }
 
-              await deleteTransaction(uid, item.id);
+          await deleteTransaction(uid, item.id);
 
-              Alert.alert(
-                "Deleted",
-                "The transaction has been deleted successfully."
-              );
-            } catch (error: any) {
-              console.error("Delete transaction error:", error);
+          Alert.alert(
+            "Deleted",
+            "The transaction has been deleted successfully."
+          );
+        } catch (error: any) {
+          console.error("Delete transaction error:", error);
 
-              Alert.alert(
-                "Delete Failed",
-                "Unable to delete this transaction. Please try again."
-              );
-            }
-          },
-        },
-      ],
-      { cancelable: true }
+          Alert.alert(
+            "Delete Failed",
+            "Unable to delete this transaction. Please try again."
+          );
+        }
+      }
     );
   };
 
@@ -134,12 +227,11 @@ export default function App() {
   const [restoreVisible, setRestoreVisible] = useState(false);
   const [restoreText, setRestoreText] = useState('');
 
+  const [forecastVisible, setForecastVisible] = useState(false);
+
   const todayStr = new Date().toISOString().split('T')[0];
   const [currentMonth, setCurrentMonth] = useState(todayStr.substring(0, 7)); 
   const [selectedDate, setSelectedDate] = useState(''); 
-
-  // === LOGIC ===
-  const currentMonthName = MONTH_MAP[currentMonth.split('-')[1]] || '';
 
   // Form State
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -150,8 +242,17 @@ export default function App() {
   const [isRepeated, setIsRepeated] = useState(false);
   
   const [loanTotal, setLoanTotal] = useState('');
+  // loanMonthsLeft is always the canonical value in months (matches the stored
+  // `monthsLeft` field and every months-based calculation elsewhere in this file).
   const [loanMonthsLeft, setLoanMonthsLeft] = useState('');
+  // loanYearsText is a separate, freely-typed display buffer used only while
+  // loanDurationUnit === 'years' — deriving it from loanMonthsLeft on every
+  // keystroke would collapse fractional years (e.g. typing "2." -> "2") because
+  // rounding to whole months and back loses the in-progress decimal.
+  const [loanDurationUnit, setLoanDurationUnit] = useState<'months' | 'years'>('months');
+  const [loanYearsText, setLoanYearsText] = useState('');
   const [repeatDay, setRepeatDay] = useState('');
+  const [newCategory, setNewCategory] = useState<string>(DEFAULT_CATEGORY);
 
   useEffect(() => {
     const initNotification = async () => {
@@ -166,41 +267,30 @@ export default function App() {
     initNotification();
   }, []);
 
+  // === LOAD SAVED BUDGET ===
+  useEffect(() => {
+    const loadBudget = async () => {
+      try {
+        const saved = await AsyncStorage.getItem('@finance_pro_budget');
+        if (saved !== null) setMonthlyBudget(saved);
+      } catch (e) {
+        console.error(e);
+      }
+    };
+
+    loadBudget();
+  }, []);
+
   const handleLogout = () => {
-    Alert.alert(
-      "Logout",
-      "Are you sure you want to logout?",
-      [
-        {
-          text: "Cancel",
-          style: "cancel",
-        },
-        {
-          text: "Logout",
-          style: "destructive",
-          onPress: async () => {
-            try {
-              await logoutUser();
-              setMenuVisible(false);
-              router.replace("/login");
-            } catch (error: any) {
-              Alert.alert("Logout Error", error.message);
-            }
-          },
-        },
-      ],
-      { cancelable: true }
-    );
-  };
-
-  const handleSelectDate = (day: number) => {
-    const monthKey = currentMonth.split('-')[1];
-    const monthName = MONTH_MAP[monthKey] || '';
-
-    const formatted = `${day}-${monthName}`;
-
-    setNewDate(formatted);
-    setDatePickerVisible(false);
+    confirmAction("Logout", "Are you sure you want to logout?", async () => {
+      try {
+        await logoutUser();
+        setMenuVisible(false);
+        router.replace("/login");
+      } catch (error: any) {
+        Alert.alert("Logout Error", error.message);
+      }
+    });
   };
 
   // === INIT ===
@@ -211,12 +301,9 @@ export default function App() {
     const ref = collection(db, "users", uid, "transactions");
 
     const unsub = onSnapshot(ref, (snapshot) => {
-      const data = snapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-      }));
+      const data = snapshot.docs.map((doc) => normalizeTransaction(doc.data(), doc.id));
 
-      setItems(data as Transaction[]);
+      setItems(data);
     });
 
     return () => unsub();
@@ -258,10 +345,7 @@ export default function App() {
 
       // 2. Smart Loan Check
       if (item.isLoan) {
-         const monthly = parseFloat(item.amount || '0');
-         const bigTotal = parseFloat(item.totalLoanAmount || '0');
-         const paidCount = item.paidMonths?.length || 0;
-         const currentBalance = bigTotal - (paidCount * monthly);
+         const currentBalance = getLoanRemainingBalance(item);
 
          // Check Balance
          if (currentBalance <= 0.1) return item.paidMonths?.includes(currentMonth);
@@ -277,7 +361,9 @@ export default function App() {
       }
 
       if (item.isRepeated) return true;
-      if (item.date.includes((MONTH_MAP[currentMonth.split('-')[1]] || ''))) return true;
+      // startMonth is "YYYY-MM" (year-aware); date is just "day-Mon" for display,
+      // so matching on date's month name would incorrectly match every year.
+      if (item.startMonth === currentMonth) return true;
       return false;
     });
 
@@ -291,28 +377,25 @@ export default function App() {
     return filtered;
   }, [items, currentMonth]);
 
-  const toggleStatus = (id: string) => {
-    const updated = items.map(item => {
-      if (item.id === id) {
-        const paidList = item.paidMonths || [];
+  const toggleStatus = async (id: string) => {
+    const uid = auth.currentUser?.uid;
+    if (!uid) return;
 
-        if (paidList.includes(currentMonth)) {
-          return {
-            ...item,
-            paidMonths: paidList.filter(m => m !== currentMonth),
-          };
-        } else {
-          return {
-            ...item,
-            paidMonths: [...paidList, currentMonth],
-          };
-        }
-      }
-      return item;
-    });
+    const item = items.find(i => i.id === id);
+    if (!item) return;
 
-  setItems(updated); // ✅ ONLY THIS
-};
+    const paidList = item.paidMonths || [];
+    const updatedPaidMonths = paidList.includes(currentMonth)
+      ? paidList.filter(m => m !== currentMonth)
+      : [...paidList, currentMonth];
+
+    try {
+      await updateTransaction(uid, id, { paidMonths: updatedPaidMonths });
+    } catch (error) {
+      console.error("Toggle paid status error:", error);
+      Alert.alert("Update Failed", "Unable to update payment status. Please try again.");
+    }
+  };
 
   // === CALCULATIONS ===
   const monthStats = useMemo(() => {
@@ -355,10 +438,7 @@ export default function App() {
 
       // LOAN: Remaining Balance
       if (item.isLoan) {
-          const bigTotal = parseFloat(item.totalLoanAmount || '0');
-          const monthly = parseFloat(item.amount || '0');
-          const paidCount = item.paidMonths?.length || 0;
-          const remaining = bigTotal - (paidCount * monthly);
+          const remaining = getLoanRemainingBalance(item);
           return acc + (remaining > 0 ? remaining : 0);
       }
 
@@ -379,10 +459,7 @@ export default function App() {
 
   // 2. LOAN BALANCE
   const totalLoanBalance = items.filter(i => i.isLoan).reduce((acc, item) => {
-      const bigTotal = parseFloat(item.totalLoanAmount || '0');
-      const monthly = parseFloat(item.amount || '0');
-      const paidCount = item.paidMonths?.length || 0;
-      const remaining = bigTotal - (paidCount * monthly);
+      const remaining = getLoanRemainingBalance(item);
       return acc + (remaining > 0 ? remaining : 0);
   }, 0);
 
@@ -390,20 +467,22 @@ export default function App() {
     return predictFutureSpending(items);
   }, [items]);
 
+  // Only alert once per crossing into over-budget, not on every items change
+  // while already over budget (was firing a notification per transaction edit).
+  const hasAlertedOverspendRef = useRef(false);
+
   useEffect(() => {
     if (!aiReport) return;
 
-    const runAIAlert = async () => {
-      if (aiReport.prediction > Number(monthlyBudget)) {
-        await scheduleDailyReminder(
-          "⚠️ Overspending Alert",
-          aiReport.message
-        );
-      }
-    };
+    const overBudget = aiReport.prediction > Number(monthlyBudget);
 
-    runAIAlert();
-  }, [aiReport]);
+    if (overBudget && !hasAlertedOverspendRef.current) {
+      hasAlertedOverspendRef.current = true;
+      scheduleDailyReminder("⚠️ Overspending Alert", aiReport.message);
+    } else if (!overBudget) {
+      hasAlertedOverspendRef.current = false;
+    }
+  }, [aiReport, monthlyBudget]);
 
   // === ACTIONS ===
   const handleOpenAdd = () => {
@@ -416,7 +495,10 @@ export default function App() {
     setIsRepeated(false);
     setLoanTotal('');
     setLoanMonthsLeft('');
+    setLoanDurationUnit('months');
+    setLoanYearsText('');
     setRepeatDay('');
+    setNewCategory(DEFAULT_CATEGORY);
     setDatePickerVisible(false);
     setModalVisible(true);
   };
@@ -432,15 +514,31 @@ export default function App() {
     setIsRepeated(item.isRepeated);
     setLoanTotal(item.totalLoanAmount || '');
     setLoanMonthsLeft(item.monthsLeft || '');
+    setLoanDurationUnit('months');
+    setLoanYearsText('');
     setRepeatDay(item.repeatDay || '');
+    setNewCategory(item.category || DEFAULT_CATEGORY);
     setModalVisible(true);
+  };
+
+  // Switching units converts the CURRENT value once, rather than re-deriving it
+  // on every keystroke (see loanYearsText comment above for why that matters).
+  const handleToggleLoanDurationUnit = (unit: 'months' | 'years') => {
+    if (unit === loanDurationUnit) return;
+
+    if (unit === 'years') {
+      const months = parseInt(loanMonthsLeft || '0', 10);
+      setLoanYearsText(months ? String(Math.round((months / 12) * 10) / 10) : '');
+    }
+
+    setLoanDurationUnit(unit);
   };
 
   const handleSaveItem = async () => {
     const uid = auth.currentUser?.uid;
     if (!uid) return;
 
-    const newItem = {
+    const payload = {
       type: newType,
       detail: newDetail,
       amount: newAmount,
@@ -451,10 +549,15 @@ export default function App() {
       totalLoanAmount: loanTotal,
       monthsLeft: loanMonthsLeft,
       repeatDay,
-      paidMonths: [],
+      category: newCategory,
     };
 
-    await addTransaction(uid, newItem);
+    if (editingId) {
+      await updateTransaction(uid, editingId, payload);
+    } else {
+      await addTransaction(uid, { ...payload, paidMonths: [] });
+    }
+
     setModalVisible(false);
   };
 
@@ -469,33 +572,28 @@ export default function App() {
   };
 
   const handleResetData = () => {
-    Alert.alert("Reset All Data", "Wipe everything?", [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "WIPE DATA",
-        style: "destructive",
-        onPress: async () => {
-          try {
-            const uid = auth.currentUser?.uid;
-            if (!uid) return;
+    confirmAction("Reset All Data", "Wipe everything?", async () => {
+      try {
+        const uid = auth.currentUser?.uid;
+        if (!uid) return;
 
-            // delete all Firestore transactions
-            const ref = collection(db, "users", uid, "transactions");
-            const snap = await getDocs(ref);
+        // delete all Firestore transactions
+        const ref = collection(db, "users", uid, "transactions");
+        const snap = await getDocs(ref);
 
-            snap.forEach(async (docItem) => {
-              await deleteDoc(doc(db, "users", uid, "transactions", docItem.id));
-            });
+        await Promise.all(
+          snap.docs.map((docItem) =>
+            deleteDoc(doc(db, "users", uid, "transactions", docItem.id))
+          )
+        );
 
-          // clear UI
-          setItems([]);
-
-          } catch (error) {
-            console.log("Reset error:", error);
-          }
-        } 
+        // clear UI
+        setItems([]);
+      } catch (error) {
+        console.error("Reset error:", error);
+        Alert.alert("Reset Failed", "Unable to wipe all data. Please try again.");
       }
-    ]);
+    });
   };
 
   const handleBackup = async () => {
@@ -505,20 +603,37 @@ export default function App() {
     } catch (error) { Alert.alert("Error sharing"); }
   };
 
-  const handleRestore = () => {
+  const handleRestore = async () => {
     try {
-        if (!restoreText) return;
-        const parsed = JSON.parse(restoreText);
-        if (Array.isArray(parsed)) {
-            setItems(parsed);
-            Alert.alert("Success", "Data Restored!");
-            setRestoreVisible(false);
-            setRestoreText('');
-        } else {
-            Alert.alert("Error", "Invalid Format");
-        }
+      if (!restoreText) return;
+      const parsed = JSON.parse(restoreText);
+
+      if (!Array.isArray(parsed)) {
+        Alert.alert("Error", "Invalid Format");
+        return;
+      }
+
+      const uid = auth.currentUser?.uid;
+      if (!uid) {
+        Alert.alert("Restore Failed", "You are not logged in. Please log in again.");
+        return;
+      }
+
+      // Re-import each backed-up transaction into Firestore as a new document
+      // (old ids from the backup aren't valid Firestore doc ids for this account).
+      await Promise.all(
+        parsed.map((item) => {
+          const { id, ...data } = item;
+          return addTransaction(uid, data);
+        })
+      );
+
+      Alert.alert("Success", "Data Restored!");
+      setRestoreVisible(false);
+      setRestoreText('');
     } catch (e) {
-        Alert.alert("Error", "Invalid JSON Code");
+      console.error("Restore error:", e);
+      Alert.alert("Error", "Invalid JSON Code");
     }
   };
 
@@ -567,7 +682,8 @@ export default function App() {
 
                 if ((item.isRepeated || item.isLoan) && item.repeatDay) {
                   d = `${currentMonth}-${item.repeatDay.padStart(2, '0')}`;
-                } else if (item.date.includes((MONTH_MAP[currentMonth.split('-')[1]] || ''))) {
+                } else if (item.date) {
+                  // item is already filtered to belong to currentMonth (see filteredItems)
                   d = `${currentMonth}-${item.date.split('-')[0].padStart(2, '0')}`;
                 }
 
@@ -603,19 +719,21 @@ export default function App() {
 
         {/* QUICK DATE FILTERS */}
         <View style={styles.quickFilterRow}>
-  
-          <TouchableOpacity
+
+          <AnimatedPressable
             style={styles.quickBtn}
+            scaleTo={0.94}
             onPress={() => {
               const today = new Date().toISOString().split('T')[0];
               setSelectedDate(today);
             }}
           >
             <Text style={styles.quickBtnText}>Today</Text>
-          </TouchableOpacity>
+          </AnimatedPressable>
 
-          <TouchableOpacity
+          <AnimatedPressable
             style={styles.quickBtn}
+            scaleTo={0.94}
             onPress={() => {
               const now = new Date();
               const firstDay = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -623,22 +741,41 @@ export default function App() {
             }}
           >
             <Text style={styles.quickBtnText}>This Month</Text>
-          </TouchableOpacity>
+          </AnimatedPressable>
 
-          <TouchableOpacity
+          <AnimatedPressable
             style={styles.quickBtn}
+            scaleTo={0.94}
             onPress={() => setSelectedDate('')}
           >
             <Text style={styles.quickBtnText}>Clear</Text>
-          </TouchableOpacity>
+          </AnimatedPressable>
 
         </View>
 
         {/* DASHBOARD */}
         <View style={styles.dashboardContainer}>
-            <View style={[styles.statCard, {borderLeftColor: COLORS.success}]}><Text style={styles.statLabel}>INCOME</Text><Text style={[styles.statValue, {color: COLORS.success}]}>RM {monthStats.income.toFixed(0)}</Text></View>
-            <View style={[styles.statCard, {borderLeftColor: COLORS.danger}]}><Text style={styles.statLabel}>EXPENSES</Text><Text style={[styles.statValue, {color: COLORS.danger}]}>RM {monthStats.expense.toFixed(0)}</Text></View>
-            <View style={[styles.statCard, {borderLeftColor: COLORS.primary}]}><Text style={styles.statLabel}>BALANCE</Text><Text style={[styles.statValue, {color: monthStats.balance>=0?COLORS.primary:COLORS.danger}]}>RM {monthStats.balance.toFixed(0)}</Text></View>
+            <View style={[styles.statCard, {borderLeftColor: COLORS.success}]}>
+              <View style={styles.statCardHeader}>
+                <MaterialIcons name="arrow-upward" size={13} color={COLORS.success} />
+                <Text style={styles.statLabel}>INCOME</Text>
+              </View>
+              <Text style={[styles.statValue, {color: COLORS.success}]}>RM {monthStats.income.toFixed(0)}</Text>
+            </View>
+            <View style={[styles.statCard, {borderLeftColor: COLORS.danger}]}>
+              <View style={styles.statCardHeader}>
+                <MaterialIcons name="arrow-downward" size={13} color={COLORS.danger} />
+                <Text style={styles.statLabel}>EXPENSES</Text>
+              </View>
+              <Text style={[styles.statValue, {color: COLORS.danger}]}>RM {monthStats.expense.toFixed(0)}</Text>
+            </View>
+            <View style={[styles.statCard, {borderLeftColor: COLORS.primary}]}>
+              <View style={styles.statCardHeader}>
+                <MaterialIcons name="account-balance-wallet" size={13} color={monthStats.balance>=0?COLORS.primary:COLORS.danger} />
+                <Text style={styles.statLabel}>BALANCE</Text>
+              </View>
+              <Text style={[styles.statValue, {color: monthStats.balance>=0?COLORS.primary:COLORS.danger}]}>RM {monthStats.balance.toFixed(0)}</Text>
+            </View>
         </View>
 
         {/* BUDGET SMART ALERT */}
@@ -651,21 +788,17 @@ export default function App() {
           <TextInput
             placeholder="Set budget e.g. 1000"
             value={monthlyBudget}
-            onChangeText={saveBudget}
+            onChangeText={(text) => saveBudget(sanitizeDecimalInput(text))}
             keyboardType="decimal-pad"
             style={styles.budgetInput}
           />
 
-          <View style={styles.budgetBar}>
-            <View
-              style={[
-                styles.budgetFill,
-                { width: `${Math.min(budgetUsedPercent, 100)}%` },
-                budgetUsedPercent >= 100 && { backgroundColor: COLORS.danger },
-                budgetUsedPercent >= 80 && budgetUsedPercent < 100 && { backgroundColor: COLORS.warning },
-              ]}
-            />
-          </View>
+          <AnimatedProgressBar
+            percent={budgetUsedPercent}
+            height={10}
+            style={{ marginBottom: 8 }}
+            fillColors={[COLORS.success, COLORS.warning, COLORS.danger]}
+          />
 
           <Text
             style={[
@@ -678,12 +811,37 @@ export default function App() {
           </Text>
         </View>
 
+        {/* SPENDING FORECAST */}
+        <AnimatedPressable onPress={() => setForecastVisible(true)} style={styles.forecastCard} scaleTo={0.98}>
+          <View style={styles.forecastHeaderRow}>
+            <View style={styles.forecastTitleRow}>
+              <MaterialIcons name="insights" size={16} color={COLORS.primary} />
+              <Text style={styles.forecastTitle}>Spending Forecast</Text>
+            </View>
+            <MaterialIcons name="chevron-right" size={18} color={COLORS.gray} />
+          </View>
+          <Text
+            style={[
+              styles.forecastValue,
+              budgetLimit > 0 && aiReport.prediction > budgetLimit && { color: COLORS.danger },
+            ]}
+          >
+            RM {aiReport.prediction.toFixed(2)} <Text style={styles.forecastValueUnit}>/ month</Text>
+          </Text>
+          <Text style={styles.forecastHint} numberOfLines={1}>
+            {budgetLimit > 0 && aiReport.prediction > budgetLimit ? '⚠️ Above your budget — tap for details' : 'Tap for details'}
+          </Text>
+        </AnimatedPressable>
+
         {/* TABS */}
         <View style={styles.tabContainer}>
-            {['all', 'income', 'expense'].map(t => (
-                <TouchableOpacity key={t} onPress={() => setActiveTab(t as any)} style={[styles.tab, activeTab === t && styles.activeTab]}>
-                    <Text style={[styles.tabText, activeTab === t && styles.activeTabText]}>{t === 'expense' ? 'EXPENSES' : t.toUpperCase()}</Text>
-                </TouchableOpacity>
+            {(['all', 'income', 'expense'] as const).map(t => (
+                <AnimatedTabButton
+                  key={t}
+                  label={t === 'expense' ? 'EXPENSES' : t.toUpperCase()}
+                  active={activeTab === t}
+                  onPress={() => setActiveTab(t)}
+                />
             ))}
         </View>
 
@@ -699,11 +857,8 @@ export default function App() {
              return false;
           })
           .map((item) => {
-           const monthly = parseFloat(item.amount || '0');
-           const bigTotal = parseFloat(item.totalLoanAmount || '0');
-           const paidCount = item.paidMonths?.length || 0;
-           const currentBalance = bigTotal - (paidCount * monthly);
-           
+           const currentBalance = getLoanRemainingBalance(item);
+
            let timelineMonthsLeft = 0;
            if (item.startMonth && item.monthsLeft) {
              const totalDuration = parseFloat(item.monthsLeft);
@@ -726,6 +881,7 @@ export default function App() {
                 <View style={styles.detailsBox}>
                     <Text style={[styles.itemTitle, paid && {textDecorationLine:'line-through', color: COLORS.gray}]}>{item.detail}</Text>
                     <View style={styles.tagsRow}>
+                        <Text style={styles.tagCategory}>{getCategoryMeta(item.category).emoji} {getCategoryMeta(item.category).label}</Text>
                         {item.isRepeated && <Text style={styles.tagBlue}>↻ Monthly</Text>}
                         {item.isLoan && <Text style={styles.tagPurple}>Loan</Text>}
                     </View>
@@ -735,6 +891,15 @@ export default function App() {
                             <Text style={{fontSize:10, color:COLORS.gray}}>
                                 Schedule: {timelineMonthsLeft > 0 ? timelineMonthsLeft : 0} months left
                             </Text>
+                            <AnimatedProgressBar
+                              percent={(() => {
+                                const bigTotal = parseFloat(item.totalLoanAmount || '0');
+                                return bigTotal > 0 ? ((bigTotal - currentBalance) / bigTotal) * 100 : 0;
+                              })()}
+                              height={5}
+                              style={{ marginTop: 6 }}
+                              fillColors={[COLORS.purple, COLORS.purple, COLORS.purple]}
+                            />
                         </View>
                     )}
                 </View>
@@ -743,9 +908,9 @@ export default function App() {
                     <Text style={[styles.itemPrice, { color: item.type === 'income' ? COLORS.success : COLORS.dark }]}>
                         {item.type === 'income' ? '+' : '-'} RM{parseFloat(item.amount).toFixed(0)}
                     </Text>
-                    <TouchableOpacity onPress={() => toggleStatus(item.id)} style={[styles.checkboxBtn, paid && {backgroundColor: COLORS.success, borderColor: COLORS.success}]}>
+                    <AnimatedPressable onPress={() => toggleStatus(item.id)} style={[styles.checkboxBtn, paid && {backgroundColor: COLORS.success, borderColor: COLORS.success}]} scaleTo={0.85}>
                        {paid && <Text style={{color:'white', fontSize: 10}}>✓</Text>}
-                    </TouchableOpacity>
+                    </AnimatedPressable>
                 </View>
 
               </View>
@@ -757,7 +922,7 @@ export default function App() {
       </ScrollView>
 
       {/* FAB */}
-      <TouchableOpacity style={styles.fab} onPress={handleOpenAdd}><Text style={styles.fabIcon}>+</Text></TouchableOpacity>
+      <AnimatedPressable style={styles.fab} onPress={handleOpenAdd} scaleTo={0.9}><Text style={styles.fabIcon}>+</Text></AnimatedPressable>
 
       {/* SIDEBAR */}
       <Modal animationType="fade" transparent={true} visible={menuVisible}>
@@ -802,8 +967,8 @@ export default function App() {
                       <Text style={[styles.drawerBtnText, {color: 'white'}]}>📥 Restore Data</Text>
                   </TouchableOpacity>
                   
-                  <TouchableOpacity onPress={handleResetData} style={[styles.drawerBtn, {backgroundColor: '#ffe3e3', marginBottom: 0}]}><Text style={[styles.drawerBtnText, {color: COLORS.danger}]}>⚠️ Reset All Data</Text></TouchableOpacity>
-                  <TouchableOpacity onPress={handleLogout} style={[styles.drawerBtn, { backgroundColor: '#ffe3e3', borderColor: '#dc3545' }]}>
+                  <TouchableOpacity onPress={handleResetData} style={[styles.drawerBtn, {backgroundColor: '#ffe3e3'}]}><Text style={[styles.drawerBtnText, {color: COLORS.danger}]}>⚠️ Reset All Data</Text></TouchableOpacity>
+                  <TouchableOpacity onPress={handleLogout} style={[styles.drawerBtn, { backgroundColor: '#ffe3e3', borderColor: '#dc3545', marginBottom: 0 }]}>
                     <Text style={[styles.drawerBtnText, { color: '#dc3545' }]}>🚪 Logout</Text>
                   </TouchableOpacity>
               </View>
@@ -836,6 +1001,51 @@ export default function App() {
         </Pressable>
       </Modal>
 
+      {/* SPENDING FORECAST MODAL */}
+      <Modal animationType="fade" transparent={true} visible={forecastVisible}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setForecastVisible(false)}>
+          <Pressable style={styles.addModal} onPress={(e) => e.stopPropagation()}>
+            <Text style={styles.addModalTitle}>📈 Spending Forecast</Text>
+            <Text style={styles.forecastMessage}>{aiReport.message}</Text>
+
+            <View style={styles.forecastCompareRow}>
+              <View style={styles.forecastCompareItem}>
+                <Text style={styles.forecastCompareLabel}>Predicted</Text>
+                <Text style={[styles.forecastCompareValue, {color: COLORS.primary}]}>RM {aiReport.prediction.toFixed(2)}</Text>
+              </View>
+              <View style={styles.forecastCompareItem}>
+                <Text style={styles.forecastCompareLabel}>Your Budget</Text>
+                <Text style={[styles.forecastCompareValue, {color: COLORS.dark}]}>RM {budgetLimit.toFixed(2)}</Text>
+              </View>
+            </View>
+
+            <AnimatedProgressBar
+              percent={budgetLimit > 0 ? (aiReport.prediction / budgetLimit) * 100 : 0}
+              height={10}
+              style={{marginTop: 15, marginBottom: 10}}
+              fillColors={[COLORS.success, COLORS.warning, COLORS.danger]}
+            />
+
+            <Text
+              style={[
+                styles.forecastStatus,
+                { color: budgetLimit > 0 && aiReport.prediction > budgetLimit ? COLORS.danger : COLORS.success },
+              ]}
+            >
+              {budgetLimit <= 0
+                ? 'Set a monthly budget to compare against your forecast.'
+                : aiReport.prediction > budgetLimit
+                  ? `Forecast is RM ${(aiReport.prediction - budgetLimit).toFixed(2)} over your budget.`
+                  : `Forecast is within budget, RM ${(budgetLimit - aiReport.prediction).toFixed(2)} to spare.`}
+            </Text>
+
+            <TouchableOpacity onPress={() => setForecastVisible(false)} style={[styles.modalActionBtn, {backgroundColor: COLORS.primary, marginTop: 20}]}>
+              <Text style={{color:'white', fontWeight:'600'}}>Got it</Text>
+            </TouchableOpacity>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
       {/* ADD/EDIT MODAL */}
       <Modal animationType="slide" transparent={true} visible={modalVisible}>
         <Pressable style={styles.modalBackdrop} onPress={Keyboard.dismiss}>
@@ -843,12 +1053,29 @@ export default function App() {
             <Text style={styles.addModalTitle}>{editingId ? 'Edit Entry' : `New Entry (${(MONTH_MAP[currentMonth.split('-')[1]] || '')})`}</Text>
             
             <View style={styles.typeToggle}>
-              <TouchableOpacity onPress={() => setNewType('income')} style={[styles.typeBtn, newType === 'income' && {backgroundColor: COLORS.success}]}><Text style={{color: newType === 'income'?'white':COLORS.gray}}>Income</Text></TouchableOpacity>
-              <TouchableOpacity onPress={() => setNewType('expense')} style={[styles.typeBtn, newType === 'expense' && {backgroundColor: COLORS.danger}]}><Text style={{color: newType === 'expense'?'white':COLORS.gray}}>Expense</Text></TouchableOpacity>
+              <AnimatedPressable onPress={() => setNewType('income')} style={[styles.typeBtn, newType === 'income' && {backgroundColor: COLORS.success}]} scaleTo={0.96}><Text style={{color: newType === 'income'?'white':COLORS.gray, fontWeight: '600'}}>Income</Text></AnimatedPressable>
+              <AnimatedPressable onPress={() => setNewType('expense')} style={[styles.typeBtn, newType === 'expense' && {backgroundColor: COLORS.danger}]} scaleTo={0.96}><Text style={{color: newType === 'expense'?'white':COLORS.gray, fontWeight: '600'}}>Expense</Text></AnimatedPressable>
             </View>
 
             <TextInput placeholder="Detail (e.g. Car Loan)" value={newDetail} onChangeText={setNewDetail} style={styles.inputField} />
-            <TextInput placeholder="This Month Payment (RM)" value={newAmount} onChangeText={setNewAmount} keyboardType="decimal-pad" style={styles.inputField} />
+            <TextInput placeholder="This Month Payment (RM)" value={newAmount} onChangeText={(text) => setNewAmount(sanitizeDecimalInput(text))} keyboardType="decimal-pad" style={styles.inputField} />
+
+            <Text style={styles.fieldLabel}>Category</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.categoryScroll}>
+              {CATEGORIES.map(cat => (
+                <AnimatedPressable
+                  key={cat.key}
+                  onPress={() => setNewCategory(cat.key)}
+                  style={[styles.categoryChip, newCategory === cat.key && styles.categoryChipActive]}
+                  scaleTo={0.92}
+                >
+                  <Text style={[styles.categoryChipText, newCategory === cat.key && styles.categoryChipTextActive]}>
+                    {cat.emoji} {cat.label}
+                  </Text>
+                </AnimatedPressable>
+              ))}
+            </ScrollView>
+
             <TouchableOpacity
               style={styles.datePickerBtn}
               onPress={() => setDatePickerVisible(!datePickerVisible)}
@@ -888,11 +1115,54 @@ export default function App() {
                         <View style={styles.checkRow}><TouchableOpacity onPress={() => setIsLoan(!isLoan)} style={[styles.checkBox, isLoan && {backgroundColor: COLORS.dark}]} /><Text>Is Loan?</Text></View>
                         {isLoan && (
                             <View style={styles.loanBox}>
-                                <Text style={{fontSize:10, color:COLORS.gray, marginBottom:5}}>Enter Total Debt & Months Remaining</Text>
-                                <View style={{flexDirection:'row', gap:10}}>
-                                    <TextInput placeholder="Total Loan Value (RM)" value={loanTotal} onChangeText={setLoanTotal} keyboardType="decimal-pad" style={[styles.inputSmall, {flex:1}]} />
-                                    <TextInput placeholder="Total Months Duration" value={loanMonthsLeft} onChangeText={setLoanMonthsLeft} keyboardType="number-pad" style={[styles.inputSmall, {flex:1}]} />
+                                <Text style={{fontSize:10, color:COLORS.gray, marginBottom:5}}>Enter Total Debt & Remaining Duration</Text>
+                                <TextInput placeholder="Total Loan Value (RM)" value={loanTotal} onChangeText={(text) => setLoanTotal(sanitizeDecimalInput(text))} keyboardType="decimal-pad" style={styles.inputSmall} />
+
+                                <View style={styles.durationRow}>
+                                  {loanDurationUnit === 'years' ? (
+                                    <TextInput
+                                      placeholder="Duration (Years)"
+                                      value={loanYearsText}
+                                      onChangeText={(text) => {
+                                        const cleaned = sanitizeDecimalInput(text);
+                                        setLoanYearsText(cleaned);
+                                        const years = parseFloat(cleaned || '0');
+                                        setLoanMonthsLeft(cleaned === '' ? '' : String(Math.round(years * 12)));
+                                      }}
+                                      keyboardType="decimal-pad"
+                                      style={[styles.inputSmall, {flex:1, marginBottom: 0}]}
+                                    />
+                                  ) : (
+                                    <TextInput
+                                      placeholder="Duration (Months)"
+                                      value={loanMonthsLeft}
+                                      onChangeText={(text) => setLoanMonthsLeft(sanitizeIntegerInput(text))}
+                                      keyboardType="number-pad"
+                                      style={[styles.inputSmall, {flex:1, marginBottom: 0}]}
+                                    />
+                                  )}
+
+                                  <View style={styles.unitToggle}>
+                                    <AnimatedPressable
+                                      onPress={() => handleToggleLoanDurationUnit('months')}
+                                      style={[styles.unitToggleBtn, loanDurationUnit === 'months' && styles.unitToggleBtnActive]}
+                                      scaleTo={0.94}
+                                    >
+                                      <Text style={[styles.unitToggleText, loanDurationUnit === 'months' && styles.unitToggleTextActive]}>Mo</Text>
+                                    </AnimatedPressable>
+                                    <AnimatedPressable
+                                      onPress={() => handleToggleLoanDurationUnit('years')}
+                                      style={[styles.unitToggleBtn, loanDurationUnit === 'years' && styles.unitToggleBtnActive]}
+                                      scaleTo={0.94}
+                                    >
+                                      <Text style={[styles.unitToggleText, loanDurationUnit === 'years' && styles.unitToggleTextActive]}>Yr</Text>
+                                    </AnimatedPressable>
+                                  </View>
                                 </View>
+
+                                {loanDurationUnit === 'years' && loanMonthsLeft !== '' && (
+                                  <Text style={styles.durationHint}>= {loanMonthsLeft} months</Text>
+                                )}
                             </View>
                         )}
                     </>
@@ -947,13 +1217,6 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
 
-  datePickerBox: {
-    backgroundColor: 'white',
-    margin: 30,
-    borderRadius: 12,
-    padding: 15,
-    maxHeight: '70%',
-  },
   datePickerBoxInline: {
     backgroundColor: '#ffffff',
     borderWidth: 1,
@@ -1014,10 +1277,11 @@ const styles = StyleSheet.create({
     color: '#212529',
   },
 
-  card: { backgroundColor: COLORS.white, margin: 15, borderRadius: 12, padding: 10, shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 5, elevation: 2 },
+  card: { backgroundColor: COLORS.white, margin: 15, borderRadius: 12, padding: 10, ...CARD_SHADOW },
   dashboardContainer: { flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 15, marginBottom: 15 },
-  statCard: { width: '31%', backgroundColor: COLORS.white, padding: 10, borderRadius: 8, borderLeftWidth: 4, elevation: 1 },
-  statLabel: { fontSize: 10, fontWeight: '700', color: COLORS.gray, marginBottom: 5 },
+  statCard: { width: '31%', backgroundColor: COLORS.white, padding: 10, borderRadius: 8, borderLeftWidth: 4, ...CARD_SHADOW },
+  statCardHeader: { flexDirection: 'row', alignItems: 'center', gap: 4, marginBottom: 5 },
+  statLabel: { fontSize: 10, fontWeight: '700', color: COLORS.gray },
   statValue: { fontSize: 14, fontWeight: 'bold' },
   budgetCard: {
     backgroundColor: COLORS.white,
@@ -1025,7 +1289,7 @@ const styles = StyleSheet.create({
     marginBottom: 15,
     borderRadius: 12,
     padding: 15,
-    elevation: 1,
+    ...CARD_SHADOW,
   },
   budgetHeader: {
     flexDirection: 'row',
@@ -1050,38 +1314,46 @@ const styles = StyleSheet.create({
     padding: 10,
     marginBottom: 10,
   },
-  budgetBar: {
-    height: 10,
-    backgroundColor: '#e9ecef',
-    borderRadius: 10,
-    overflow: 'hidden',
-    marginBottom: 8,
-  },
-  budgetFill: {
-    height: '100%',
-    backgroundColor: COLORS.success,
-  },
   budgetMessage: {
     fontSize: 12,
     fontWeight: '600',
     color: COLORS.success,
   },
+  forecastCard: {
+    backgroundColor: COLORS.white,
+    marginHorizontal: 15,
+    marginBottom: 15,
+    borderRadius: 12,
+    padding: 15,
+    ...CARD_SHADOW,
+  },
+  forecastHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
+  forecastTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  forecastTitle: { fontSize: 13, fontWeight: '700', color: COLORS.dark },
+  forecastValue: { fontSize: 20, fontWeight: 'bold', color: COLORS.dark, marginBottom: 2 },
+  forecastValueUnit: { fontSize: 12, fontWeight: '400', color: COLORS.gray },
+  forecastHint: { fontSize: 11, color: COLORS.gray },
+  forecastMessage: { textAlign: 'center', color: COLORS.gray, fontSize: 13, marginBottom: 15 },
+  forecastCompareRow: { flexDirection: 'row', justifyContent: 'space-around' },
+  forecastCompareItem: { alignItems: 'center' },
+  forecastCompareLabel: { fontSize: 11, color: COLORS.gray, marginBottom: 4 },
+  forecastCompareValue: { fontSize: 18, fontWeight: 'bold' },
+  forecastStatus: { textAlign: 'center', fontSize: 12, fontWeight: '600' },
   tabContainer: { flexDirection: 'row', marginHorizontal: 15, backgroundColor: COLORS.white, borderRadius: 8, padding: 4, marginBottom: 10 },
   tab: { flex: 1, paddingVertical: 8, alignItems: 'center', borderRadius: 6 },
-  activeTab: { backgroundColor: COLORS.dark },
-  tabText: { fontSize: 12, fontWeight: '600', color: COLORS.gray },
-  activeTabText: { color: COLORS.white },
+  tabText: { fontSize: 12, fontWeight: '600' },
   listContainer: { paddingHorizontal: 15 },
   
-  transactionCard: { backgroundColor: COLORS.white, flexDirection: 'row', borderRadius: 12, marginBottom: 10, alignItems: 'center', elevation: 1, padding: 10 },
+  transactionCard: { backgroundColor: COLORS.white, flexDirection: 'row', borderRadius: 12, marginBottom: 10, alignItems: 'center', padding: 10, ...CARD_SHADOW },
   dateBox: { backgroundColor: '#f1f5f9', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, alignItems: 'center', marginRight: 12 },
   dateNum: { fontSize: 18, fontWeight: 'bold', color: COLORS.dark },
   dateMonth: { fontSize: 10, color: COLORS.gray, textTransform: 'uppercase' },
   detailsBox: { flex: 1 },
   itemTitle: { fontSize: 15, fontWeight: '600', color: COLORS.dark, marginBottom: 4 },
-  tagsRow: { flexDirection: 'row', gap: 5 },
+  tagsRow: { flexDirection: 'row', gap: 5, flexWrap: 'wrap' },
   tagBlue: { fontSize: 10, color: COLORS.primary, backgroundColor: '#cfe2ff', paddingHorizontal: 6, borderRadius: 4, overflow: 'hidden' },
   tagPurple: { fontSize: 10, color: COLORS.purple, backgroundColor: COLORS.purpleLight, paddingHorizontal: 6, borderRadius: 4, overflow: 'hidden' },
+  tagCategory: { fontSize: 10, color: COLORS.gray, backgroundColor: '#e9ecef', paddingHorizontal: 6, borderRadius: 4, overflow: 'hidden' },
   loanSub: { fontSize: 10, color: COLORS.danger, marginTop: 2 },
   itemPrice: { fontSize: 15, fontWeight: '700', marginBottom: 5 },
   checkboxBtn: { width: 22, height: 22, borderRadius: 11, borderWidth: 1, borderColor: '#adb5bd', justifyContent: 'center', alignItems: 'center', marginTop: 2 },
@@ -1094,10 +1366,23 @@ const styles = StyleSheet.create({
   typeToggle: { flexDirection: 'row', marginBottom: 15 },
   typeBtn: { flex: 1, padding: 10, alignItems: 'center', borderWidth: 1, borderColor: COLORS.border },
   inputField: { borderWidth: 1, borderColor: COLORS.border, borderRadius: 8, padding: 10, marginBottom: 10, backgroundColor: '#f8f9fa' },
+  fieldLabel: { fontSize: 12, fontWeight: '700', color: COLORS.gray, marginBottom: 8 },
+  categoryScroll: { marginBottom: 10 },
+  categoryChip: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 20, backgroundColor: '#f1f3f5', borderWidth: 1, borderColor: COLORS.border, marginRight: 8 },
+  categoryChipActive: { backgroundColor: COLORS.primary, borderColor: COLORS.primary },
+  categoryChipText: { fontSize: 12, fontWeight: '600', color: COLORS.dark },
+  categoryChipTextActive: { color: COLORS.white },
   checkRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 10, marginTop: 5 },
   checkBox: { width: 20, height: 20, borderWidth: 1, borderColor: COLORS.gray, borderRadius: 4, marginRight: 10 },
   inputSmall: { borderWidth: 1, borderColor: COLORS.border, borderRadius: 8, padding: 8, marginBottom: 10 },
   loanBox: { backgroundColor: '#f8f9fa', padding: 10, borderRadius: 8 },
+  durationRow: { flexDirection: 'row', gap: 8, alignItems: 'center' },
+  unitToggle: { flexDirection: 'row', backgroundColor: '#e9ecef', borderRadius: 8, padding: 2 },
+  unitToggleBtn: { paddingHorizontal: 10, paddingVertical: 8, borderRadius: 6 },
+  unitToggleBtnActive: { backgroundColor: COLORS.primary },
+  unitToggleText: { fontSize: 12, fontWeight: '700', color: COLORS.gray },
+  unitToggleTextActive: { color: COLORS.white },
+  durationHint: { fontSize: 10, color: COLORS.gray, marginTop: -4, marginBottom: 4 },
   modalBtnRow: { flexDirection: 'row', gap: 10, marginTop: 15 },
   modalActionBtn: { flex: 1, padding: 12, borderRadius: 8, alignItems: 'center' },
   filterBadge: { backgroundColor: COLORS.dark, alignSelf: 'center', paddingHorizontal: 12, paddingVertical: 4, borderRadius: 12, marginTop: 10 },
