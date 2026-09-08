@@ -16,8 +16,10 @@ export default function Login() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
 
   const handleLogin = async () => {
+    if (isLoggingIn) return;
     const cleanEmail = email.trim().toLowerCase();
 
     if (!cleanEmail || password.length === 0) {
@@ -29,6 +31,7 @@ export default function Login() {
     }
 
     try {
+      setIsLoggingIn(true);
       await loginUser(cleanEmail, password);
       router.replace("/(tabs)");
     } catch (error: any) {
@@ -71,6 +74,8 @@ export default function Login() {
       }
 
       Alert.alert("Login Failed", message);
+    } finally {
+      setIsLoggingIn(false);
     }
   };
 
@@ -96,13 +101,18 @@ export default function Login() {
           <Text style={styles.subtitle}>Sign in to continue</Text>
 
           <TextInput
-          placeholder="Email"
+            accessibilityLabel="Email address"
+            placeholder="Email"
             placeholderTextColor="#9ca3af"
             style={styles.input}
             onChangeText={setEmail}
+            autoCapitalize="none"
+            autoComplete="email"
+            keyboardType="email-address"
           />
 
           <TextInput
+            accessibilityLabel="Password"
             placeholder="Password"
             placeholderTextColor="#9ca3af"
             style={styles.input}
@@ -110,8 +120,8 @@ export default function Login() {
             onChangeText={setPassword}
           />
 
-          <TouchableOpacity style={styles.button} onPress={handleLogin}>
-            <Text style={styles.buttonText}>Login</Text>
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Log in" disabled={isLoggingIn} style={[styles.button, isLoggingIn && styles.buttonDisabled]} onPress={handleLogin}>
+            <Text style={styles.buttonText}>{isLoggingIn ? "Logging in…" : "Login"}</Text>
           </TouchableOpacity>
 
           <TouchableOpacity onPress={() => router.push("/register")}>
@@ -152,6 +162,10 @@ const styles = StyleSheet.create({
     padding: 14,
     borderRadius: 12,
     marginTop: 10,
+  },
+
+  buttonDisabled: {
+    opacity: 0.6,
   },
 
   buttonText: {

@@ -3,11 +3,10 @@ import { Stack, useRouter, useSegments } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
-import { View, ActivityIndicator } from "react-native";
+import { ActivityIndicator, View, useColorScheme } from "react-native";
 import "react-native-reanimated";
 
 import { auth } from "../services/firebase";
-import { useColorScheme } from "react-native";
 
 export const unstable_settings = {
   anchor: "(tabs)",
@@ -45,7 +44,7 @@ export default function RootLayout() {
     if (user && inAuthPages) {
       router.replace("/(tabs)");
     }
-  }, [user, loading, segments]);
+  }, [router, user, loading, segments]);
 
   // ⏳ LOADING SCREEN
   if (loading) {
