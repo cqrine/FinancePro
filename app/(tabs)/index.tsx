@@ -1,15 +1,17 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { logoutUser } from "../../services/authService";
-import { auth } from "../../services/firebase";
+import { auth, db } from "../../services/firebase";
 import { addTransaction, deleteTransaction, updateTransaction } from "../../services/transactionService";
 import { useRouter } from "expo-router";
+import { onAuthStateChanged } from "firebase/auth";
 import { onSnapshot, collection, getDocs, deleteDoc, doc } from "firebase/firestore";
-import { db } from "../../services/firebase";
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { requestNotificationPermission, scheduleDailyReminder } from "../../services/notificationService";
 import { predictFutureSpending } from "../../services/aiService";
-import FinancialReport from "../../components/FinancialReport";
-import * as Notifications from "expo-notifications";
+import { SpendingPreview } from '../../components/spending-preview';
+import { amountOf, normalizeDay, parseAmount, transactionsForMonth } from '../../services/analytics';
+import { validateTransactionDraft } from '../../services/transactionValidation';
+import { seedDemoData } from '../../services/demoData';
 import {
   Alert,
   Keyboard,
@@ -64,6 +66,7 @@ const CATEGORIES = [
 ] as const;
 
 const DEFAULT_CATEGORY = 'other';
+const budgetStorageKey = (uid: string) => `@finance_pro_budget_${uid}`;
 
 // Consistent depth across cards on both platforms — iOS only reads the shadow*
 // props, Android only reads elevation, so both need to be set every time.
@@ -115,10 +118,10 @@ const normalizeTransaction = (raw: any, id: string): Transaction => ({
 // Shared by filteredItems, totalDebt, totalLoanBalance, and the list render —
 // was previously reimplemented (and easy to accidentally desync) in all four places.
 const getLoanRemainingBalance = (item: Pick<Transaction, 'totalLoanAmount' | 'amount' | 'paidMonths'>) => {
-  const bigTotal = parseFloat(item.totalLoanAmount || '0');
-  const monthly = parseFloat(item.amount || '0');
+  const bigTotal = parseAmount(item.totalLoanAmount);
+  const monthly = parseAmount(item.amount);
   const paidCount = item.paidMonths?.length || 0;
-  return bigTotal - (paidCount * monthly);
+  return Math.max(0, bigTotal - (paidCount * monthly));
 };
 
 // keyboardType="decimal-pad" only hints at which on-screen keyboard to show —
@@ -180,6 +183,8 @@ function AnimatedTabButton({ label, active, onPress }: { label: string; active: 
 
 export default function App() {
   const handleDelete = (item: Transaction) => {
+    if (busyTransactionId === item.id) return;
+
     confirmAction(
       "Delete Transaction",
       `Are you sure you want to delete "${item.detail}"?`,
@@ -195,6 +200,7 @@ export default function App() {
             return;
           }
 
+          setBusyTransactionId(item.id);
           await deleteTransaction(uid, item.id);
 
           Alert.alert(
@@ -208,6 +214,8 @@ export default function App() {
             "Delete Failed",
             "Unable to delete this transaction. Please try again."
           );
+        } finally {
+          setBusyTransactionId(null);
         }
       }
     );
@@ -221,6 +229,10 @@ export default function App() {
   const [monthlyBudget, setMonthlyBudget] = useState('1000');
   const [modalVisible, setModalVisible] = useState(false); 
   const [menuVisible, setMenuVisible] = useState(false);
+  const [isSeedingDemo, setIsSeedingDemo] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
+  const [busyTransactionId, setBusyTransactionId] = useState<string | null>(null);
   const [newDate, setNewDate] = useState('');
   const [datePickerVisible, setDatePickerVisible] = useState(false);
   
@@ -232,6 +244,7 @@ export default function App() {
 
   const todayStr = new Date().toISOString().split('T')[0];
   const [currentMonth, setCurrentMonth] = useState(todayStr.substring(0, 7)); 
+  const [entryStartMonth, setEntryStartMonth] = useState(todayStr.substring(0, 7));
   const [selectedDate, setSelectedDate] = useState(''); 
 
   // Form State
@@ -268,18 +281,26 @@ export default function App() {
     initNotification();
   }, []);
 
-  // === LOAD SAVED BUDGET ===
+  // === LOAD ACCOUNT-SCOPED BUDGET ===
   useEffect(() => {
-    const loadBudget = async () => {
-      try {
-        const saved = await AsyncStorage.getItem('@finance_pro_budget');
-        if (saved !== null) setMonthlyBudget(saved);
-      } catch (e) {
-        console.error(e);
+    let cancelled = false;
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (!user) {
+        setMonthlyBudget('1000');
+        return;
       }
-    };
 
-    loadBudget();
+      AsyncStorage.getItem(budgetStorageKey(user.uid))
+        .then((saved) => {
+          if (!cancelled && saved !== null) setMonthlyBudget(saved);
+        })
+        .catch((error) => console.error('Load budget error:', error));
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, []);
 
   const handleLogout = () => {
@@ -296,33 +317,40 @@ export default function App() {
 
   // === INIT ===
   useEffect(() => {
-    const uid = auth.currentUser?.uid;
-    if (!uid) return;
+    let unsubscribeTransactions: (() => void) | undefined;
+    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
+      unsubscribeTransactions?.();
+      unsubscribeTransactions = undefined;
+      setItems([]);
 
-    const ref = collection(db, "users", uid, "transactions");
+      if (!user) return;
 
-    const unsub = onSnapshot(ref, (snapshot) => {
-      const data = snapshot.docs.map((doc) => normalizeTransaction(doc.data(), doc.id));
-
-      setItems(data);
+      const ref = collection(db, "users", user.uid, "transactions");
+      unsubscribeTransactions = onSnapshot(
+        ref,
+        (snapshot) => {
+          const data = snapshot.docs.map((doc) => normalizeTransaction(doc.data(), doc.id));
+          setItems(data);
+        },
+        (error) => console.error('Load transactions error:', error),
+      );
     });
 
-    return () => unsub();
+    return () => {
+      unsubscribeAuth();
+      unsubscribeTransactions?.();
+    };
   }, []);
 
-  const saveData = async (item: Transaction) => {
+  const saveBudget = async (value: string) => {
     const uid = auth.currentUser?.uid;
+    setMonthlyBudget(value);
     if (!uid) return;
 
-    await addTransaction(uid, item);
-  };
-
-  const saveBudget = async (value: string) => {
     try {
-      setMonthlyBudget(value);
-      await AsyncStorage.setItem('@finance_pro_budget', value);
+      await AsyncStorage.setItem(budgetStorageKey(uid), value);
     } catch (e) {
-      console.error(e);
+      console.error('Save budget error:', e);
     }
   };
 
@@ -340,38 +368,12 @@ export default function App() {
   
 
   const filteredItems = useMemo(() => {
-    let filtered = items.filter(item => {
-      // 1. Start Date Check
-      if (item.startMonth && item.startMonth > currentMonth) return false; 
-
-      // 2. Smart Loan Check
-      if (item.isLoan) {
-         const currentBalance = getLoanRemainingBalance(item);
-
-         // Check Balance
-         if (currentBalance <= 0.1) return item.paidMonths?.includes(currentMonth);
-
-         // Check Time
-         if (item.startMonth && item.monthsLeft) {
-             const totalDuration = parseFloat(item.monthsLeft);
-             const monthsPassed = getMonthDiff(item.startMonth, currentMonth);
-             const timelineLeft = totalDuration - monthsPassed;
-             if (timelineLeft <= 0) return item.paidMonths?.includes(currentMonth);
-         }
-         return true;
-      }
-
-      if (item.isRepeated) return true;
-      // startMonth is "YYYY-MM" (year-aware); date is just "day-Mon" for display,
-      // so matching on date's month name would incorrectly match every year.
-      if (item.startMonth === currentMonth) return true;
-      return false;
-    });
+    const filtered = transactionsForMonth(items, currentMonth);
 
     filtered.sort((a, b) => {
       const getDay = (item: Transaction) => {
-        if ((item.isRepeated || item.isLoan) && item.repeatDay) return parseInt(item.repeatDay);
-        return parseInt(item.date.split('-')[0]) || 99;
+        if (item.isRepeated || item.isLoan) return normalizeDay(item.repeatDay) ?? 99;
+        return normalizeDay(item.date.split('-')[0]) ?? 99;
       };
       return getDay(a) - getDay(b);
     });
@@ -379,6 +381,8 @@ export default function App() {
   }, [items, currentMonth]);
 
   const toggleStatus = async (id: string) => {
+    if (busyTransactionId === id) return;
+
     const uid = auth.currentUser?.uid;
     if (!uid) return;
 
@@ -391,10 +395,13 @@ export default function App() {
       : [...paidList, currentMonth];
 
     try {
+      setBusyTransactionId(id);
       await updateTransaction(uid, id, { paidMonths: updatedPaidMonths });
     } catch (error) {
       console.error("Toggle paid status error:", error);
       Alert.alert("Update Failed", "Unable to update payment status. Please try again.");
+    } finally {
+      setBusyTransactionId(null);
     }
   };
 
@@ -403,7 +410,7 @@ export default function App() {
     let income = 0, expense = 0, fixedCommitments = 0, unpaidExpenses = 0;
     
     filteredItems.forEach(item => {
-      const val = parseFloat(item.amount || '0');
+      const val = amountOf(item);
       
       if (item.type === 'income') {
         income += val;
@@ -413,7 +420,7 @@ export default function App() {
         if (item.isLoan || item.isRepeated) fixedCommitments += val;
         
         // Unpaid Expenses Logic
-        if (!isPaidThisMonth(item)) {
+        if (!item.paidMonths?.includes(currentMonth)) {
             unpaidExpenses += val;
         }
       }
@@ -421,7 +428,7 @@ export default function App() {
     return { income, expense, balance: income - expense, fixedCommitments, unpaidExpenses };
   }, [filteredItems, currentMonth]);
 
-  const budgetLimit = parseFloat(monthlyBudget || '0');
+  const budgetLimit = parseAmount(monthlyBudget);
   const budgetUsedPercent = budgetLimit > 0 ? (monthStats.expense / budgetLimit) * 100 : 0;
 
   const budgetAlert =
@@ -446,14 +453,14 @@ export default function App() {
       // RECURRING: If unpaid current month
       if (item.isRepeated) {
           if (!item.paidMonths?.includes(currentMonth) && item.startMonth && item.startMonth <= currentMonth) {
-              return acc + parseFloat(item.amount || '0');
+              return acc + amountOf(item);
           }
           return acc;
       }
 
       // ONE-TIME: If unpaid and in current/future
       if (item.startMonth && item.startMonth >= currentMonth) {
-          if ((item.paidMonths || []).length === 0) return acc + parseFloat(item.amount || '0');
+          if ((item.paidMonths || []).length === 0) return acc + amountOf(item);
       }
       return acc;
   }, 0);
@@ -488,6 +495,8 @@ export default function App() {
   // === ACTIONS ===
   const handleOpenAdd = () => {
     setEditingId(null);
+    setEntryStartMonth(currentMonth);
+    setSaveError('');
     setNewDetail('');
     setNewAmount('');
     setNewDate('');
@@ -506,10 +515,11 @@ export default function App() {
 
   const handleOpenEdit = (item: Transaction) => {
     setEditingId(item.id);
+    setEntryStartMonth(item.startMonth || currentMonth);
+    setSaveError('');
     setNewDetail(item.detail);
     setNewAmount(item.amount);
-    const dayOnly = item.date.split('-')[0];
-    setNewDate(dayOnly);
+    setNewDate(item.date || '');
     setNewType(item.type);
     setIsLoan(item.isLoan);
     setIsRepeated(item.isRepeated);
@@ -536,30 +546,63 @@ export default function App() {
   };
 
   const handleSaveItem = async () => {
-    const uid = auth.currentUser?.uid;
-    if (!uid) return;
+    if (isSaving) return;
 
-    const payload = {
+    const uid = auth.currentUser?.uid;
+    if (!uid) {
+      setSaveError('You are not logged in. Please log in again.');
+      return;
+    }
+
+    const validationError = validateTransactionDraft({
       type: newType,
       detail: newDetail,
       amount: newAmount,
       date: newDate,
       isLoan,
       isRepeated,
-      startMonth: currentMonth,
+      startMonth: entryStartMonth,
       totalLoanAmount: loanTotal,
       monthsLeft: loanMonthsLeft,
       repeatDay,
       category: newCategory,
-    };
+    });
 
-    if (editingId) {
-      await updateTransaction(uid, editingId, payload);
-    } else {
-      await addTransaction(uid, { ...payload, paidMonths: [] });
+    if (validationError) {
+      setSaveError(validationError);
+      return;
     }
 
-    setModalVisible(false);
+    const payload = {
+      type: newType,
+      detail: newDetail.trim(),
+      amount: parseAmount(newAmount).toFixed(2),
+      date: newDate,
+      isLoan,
+      isRepeated,
+      startMonth: entryStartMonth,
+      totalLoanAmount: isLoan ? parseAmount(loanTotal).toFixed(2) : '',
+      monthsLeft: isLoan ? String(Math.trunc(Number(loanMonthsLeft))) : '',
+      repeatDay: isRepeated || isLoan ? String(normalizeDay(repeatDay)) : '',
+      category: newCategory,
+    };
+
+    setSaveError('');
+    setIsSaving(true);
+    try {
+      if (editingId) {
+        await updateTransaction(uid, editingId, payload);
+      } else {
+        await addTransaction(uid, { ...payload, paidMonths: [] });
+      }
+
+      setModalVisible(false);
+    } catch (error) {
+      console.error('Save transaction error:', error);
+      setSaveError('Unable to save this entry. Check your connection and try again.');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const handleLongPress = (item: Transaction) => {
@@ -601,7 +644,7 @@ export default function App() {
     try {
       const json = JSON.stringify(items, null, 2);
       await Share.share({ message: json, title: 'FinancePro Backup' });
-    } catch (error) { Alert.alert("Error sharing"); }
+    } catch { Alert.alert("Error sharing"); }
   };
 
   const handleRestore = async () => {
@@ -644,6 +687,33 @@ export default function App() {
       setTimeout(() => setRestoreVisible(true), 300);
   };
 
+  const handleSeedDemo = () => {
+    if (isSeedingDemo) return;
+    if (items.some(item => item.detail.startsWith('Demo ·'))) {
+      Alert.alert('Demo data already loaded', 'This account already contains demo entries. Reset the data first if you want to load a fresh set.');
+      return;
+    }
+
+    confirmAction('Load demo data?', 'This adds sample income, bills, loan payments, and categorized expenses to the signed-in account.', async () => {
+      const uid = auth.currentUser?.uid;
+      if (!uid) {
+        Alert.alert('Demo data failed', 'You are not logged in. Please log in again.');
+        return;
+      }
+      setIsSeedingDemo(true);
+      try {
+        const count = await seedDemoData(uid);
+        setMenuVisible(false);
+        Alert.alert('Demo data loaded', `${count} sample entries were added. Open Insights to explore the charts.`);
+      } catch (error) {
+        console.error('Demo data error:', error);
+        Alert.alert('Demo data failed', 'Unable to add the sample entries. Check your connection and try again.');
+      } finally {
+        setIsSeedingDemo(false);
+      }
+    });
+  };
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="dark-content" backgroundColor={COLORS.light} />
@@ -680,12 +750,14 @@ export default function App() {
 
               ...filteredItems.reduce((acc: any, item) => {
                 let d = '';
+                const recurringDay = normalizeDay(item.repeatDay);
+                const oneTimeDay = normalizeDay(item.date?.split('-')[0]);
 
-                if ((item.isRepeated || item.isLoan) && item.repeatDay) {
-                  d = `${currentMonth}-${item.repeatDay.padStart(2, '0')}`;
-                } else if (item.date) {
+                if ((item.isRepeated || item.isLoan) && recurringDay !== null) {
+                  d = `${currentMonth}-${String(recurringDay).padStart(2, '0')}`;
+                } else if (oneTimeDay !== null) {
                   // item is already filtered to belong to currentMonth (see filteredItems)
-                  d = `${currentMonth}-${item.date.split('-')[0].padStart(2, '0')}`;
+                  d = `${currentMonth}-${String(oneTimeDay).padStart(2, '0')}`;
                 }
 
                 if (d) {
@@ -779,9 +851,7 @@ export default function App() {
             </View>
         </View>
 
-        <FinancialReport 
-          transactions={items}
-        />
+        <SpendingPreview items={items} month={currentMonth} />
 
         {/* BUDGET SMART ALERT */}
         <View style={styles.budgetCard}>
@@ -792,8 +862,10 @@ export default function App() {
 
           <TextInput
             placeholder="Set budget e.g. 1000"
+            accessibilityLabel="Monthly budget"
             value={monthlyBudget}
-            onChangeText={(text) => saveBudget(sanitizeDecimalInput(text))}
+            onChangeText={(text) => setMonthlyBudget(sanitizeDecimalInput(text))}
+            onEndEditing={() => { void saveBudget(monthlyBudget); }}
             keyboardType="decimal-pad"
             style={styles.budgetInput}
           />
@@ -817,7 +889,7 @@ export default function App() {
         </View>
 
         {/* SPENDING FORECAST */}
-        <AnimatedPressable onPress={() => setForecastVisible(true)} style={styles.forecastCard} scaleTo={0.98}>
+        <AnimatedPressable accessibilityRole="button" accessibilityLabel="Open spending forecast" onPress={() => setForecastVisible(true)} style={styles.forecastCard} scaleTo={0.98}>
           <View style={styles.forecastHeaderRow}>
             <View style={styles.forecastTitleRow}>
               <MaterialIcons name="insights" size={16} color={COLORS.primary} />
@@ -856,9 +928,10 @@ export default function App() {
           .filter(item => activeTab === 'all' || item.type === activeTab)
           .filter(item => {
              if (!selectedDate) return true;
-             const dayNum = parseInt(selectedDate.split('-')[2]).toString();
-             if ((item.isRepeated || item.isLoan) && item.repeatDay === dayNum) return true;
-             if (item.date.startsWith(dayNum + '-')) return true;
+             const dayNum = normalizeDay(selectedDate.split('-')[2]);
+             if (dayNum === null) return false;
+             if ((item.isRepeated || item.isLoan) && normalizeDay(item.repeatDay) === dayNum) return true;
+             if (normalizeDay(item.date.split('-')[0]) === dayNum) return true;
              return false;
           })
           .map((item) => {
@@ -866,17 +939,20 @@ export default function App() {
 
            let timelineMonthsLeft = 0;
            if (item.startMonth && item.monthsLeft) {
-             const totalDuration = parseFloat(item.monthsLeft);
+             const totalDuration = Number(item.monthsLeft) || 0;
              const monthsPassed = getMonthDiff(item.startMonth, currentMonth);
              timelineMonthsLeft = totalDuration - monthsPassed;
            }
 
-           const displayDay = ((item.isRepeated || item.isLoan) && item.repeatDay) ? item.repeatDay : item.date.split('-')[0];
+           const displayDay = ((item.isRepeated || item.isLoan) && normalizeDay(item.repeatDay))
+             || normalizeDay(item.date.split('-')[0])
+             || '—';
            const paid = isPaidThisMonth(item);
+           const isBusy = busyTransactionId === item.id;
 
            return (
             <TouchableOpacity key={item.id} onLongPress={() => handleLongPress(item)} activeOpacity={0.9}>
-              <View style={[styles.transactionCard, { opacity: paid ? 0.6 : 1 }]}>
+              <View style={[styles.transactionCard, { opacity: isBusy ? 0.45 : paid ? 0.6 : 1 }]}>
                 
                 <View style={styles.dateBox}>
                     <Text style={styles.dateNum}>{displayDay}</Text>
@@ -898,7 +974,7 @@ export default function App() {
                             </Text>
                             <AnimatedProgressBar
                               percent={(() => {
-                                const bigTotal = parseFloat(item.totalLoanAmount || '0');
+                                const bigTotal = parseAmount(item.totalLoanAmount);
                                 return bigTotal > 0 ? ((bigTotal - currentBalance) / bigTotal) * 100 : 0;
                               })()}
                               height={5}
@@ -911,23 +987,51 @@ export default function App() {
 
                 <View style={{alignItems:'flex-end'}}>
                     <Text style={[styles.itemPrice, { color: item.type === 'income' ? COLORS.success : COLORS.dark }]}>
-                        {item.type === 'income' ? '+' : '-'} RM{parseFloat(item.amount).toFixed(0)}
+                        {item.type === 'income' ? '+' : '-'} RM{amountOf(item).toFixed(0)}
                     </Text>
-                    <AnimatedPressable onPress={() => toggleStatus(item.id)} style={[styles.checkboxBtn, paid && {backgroundColor: COLORS.success, borderColor: COLORS.success}]} scaleTo={0.85}>
+                    <AnimatedPressable
+                      accessibilityRole="button"
+                      accessibilityLabel={paid ? `Mark ${item.detail} as unpaid` : `Mark ${item.detail} as paid`}
+                      disabled={isBusy}
+                      onPress={() => toggleStatus(item.id)}
+                      style={[styles.checkboxBtn, paid && {backgroundColor: COLORS.success, borderColor: COLORS.success}]}
+                      scaleTo={0.85}
+                    >
                        {paid && <Text style={{color:'white', fontSize: 10}}>✓</Text>}
                     </AnimatedPressable>
+                </View>
+
+                <View style={styles.rowActions}>
+                  <TouchableOpacity
+                    accessibilityRole="button"
+                    accessibilityLabel={`Edit ${item.detail}`}
+                    disabled={isBusy}
+                    onPress={() => handleOpenEdit(item)}
+                    style={styles.rowActionButton}
+                  >
+                    <MaterialIcons name="edit" size={17} color={COLORS.primary} />
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    accessibilityRole="button"
+                    accessibilityLabel={`Delete ${item.detail}`}
+                    disabled={isBusy}
+                    onPress={() => handleDelete(item)}
+                    style={styles.rowActionButton}
+                  >
+                    <MaterialIcons name="delete-outline" size={18} color={COLORS.danger} />
+                  </TouchableOpacity>
                 </View>
 
               </View>
             </TouchableOpacity>
           );
         })}
-        <Text style={{textAlign:'center', color:'#adb5bd', fontSize:12, marginTop:20}}>Long press an item to Edit or Delete</Text>
+        <Text style={{textAlign:'center', color:'#adb5bd', fontSize:12, marginTop:20}}>Use the edit or delete buttons; long press also opens actions.</Text>
         </View>
       </ScrollView>
 
       {/* FAB */}
-      <AnimatedPressable style={styles.fab} onPress={handleOpenAdd} scaleTo={0.9}><Text style={styles.fabIcon}>+</Text></AnimatedPressable>
+      <AnimatedPressable accessibilityRole="button" accessibilityLabel="Add transaction" style={styles.fab} onPress={handleOpenAdd} scaleTo={0.9}><Text style={styles.fabIcon}>+</Text></AnimatedPressable>
 
       {/* SIDEBAR */}
       <Modal animationType="fade" transparent={true} visible={menuVisible}>
@@ -971,6 +1075,9 @@ export default function App() {
                   <TouchableOpacity onPress={openRestoreModal} style={[styles.drawerBtn, {backgroundColor: COLORS.primary}]}>
                       <Text style={[styles.drawerBtnText, {color: 'white'}]}>📥 Restore Data</Text>
                   </TouchableOpacity>
+                  {__DEV__ && <TouchableOpacity disabled={isSeedingDemo} onPress={handleSeedDemo} style={[styles.drawerBtn, {backgroundColor: '#E0F2FE', borderColor: '#0284C7'}]}>
+                      <Text style={[styles.drawerBtnText, {color: '#0369A1'}]}>{isSeedingDemo ? '⏳ Loading Demo Data…' : '🧪 Load Demo Data'}</Text>
+                  </TouchableOpacity>}
                   
                   <TouchableOpacity onPress={handleResetData} style={[styles.drawerBtn, {backgroundColor: '#ffe3e3'}]}><Text style={[styles.drawerBtnText, {color: COLORS.danger}]}>⚠️ Reset All Data</Text></TouchableOpacity>
                   <TouchableOpacity onPress={handleLogout} style={[styles.drawerBtn, { backgroundColor: '#ffe3e3', borderColor: '#dc3545', marginBottom: 0 }]}>
@@ -1058,18 +1165,21 @@ export default function App() {
             <Text style={styles.addModalTitle}>{editingId ? 'Edit Entry' : `New Entry (${(MONTH_MAP[currentMonth.split('-')[1]] || '')})`}</Text>
             
             <View style={styles.typeToggle}>
-              <AnimatedPressable onPress={() => setNewType('income')} style={[styles.typeBtn, newType === 'income' && {backgroundColor: COLORS.success}]} scaleTo={0.96}><Text style={{color: newType === 'income'?'white':COLORS.gray, fontWeight: '600'}}>Income</Text></AnimatedPressable>
-              <AnimatedPressable onPress={() => setNewType('expense')} style={[styles.typeBtn, newType === 'expense' && {backgroundColor: COLORS.danger}]} scaleTo={0.96}><Text style={{color: newType === 'expense'?'white':COLORS.gray, fontWeight: '600'}}>Expense</Text></AnimatedPressable>
+              <AnimatedPressable accessibilityRole="radio" accessibilityState={{selected: newType === 'income'}} accessibilityLabel="Income" onPress={() => { setNewType('income'); setIsLoan(false); }} style={[styles.typeBtn, newType === 'income' && {backgroundColor: COLORS.success}]} scaleTo={0.96}><Text style={{color: newType === 'income'?'white':COLORS.gray, fontWeight: '600'}}>Income</Text></AnimatedPressable>
+              <AnimatedPressable accessibilityRole="radio" accessibilityState={{selected: newType === 'expense'}} accessibilityLabel="Expense" onPress={() => setNewType('expense')} style={[styles.typeBtn, newType === 'expense' && {backgroundColor: COLORS.danger}]} scaleTo={0.96}><Text style={{color: newType === 'expense'?'white':COLORS.gray, fontWeight: '600'}}>Expense</Text></AnimatedPressable>
             </View>
 
-            <TextInput placeholder="Detail (e.g. Car Loan)" value={newDetail} onChangeText={setNewDetail} style={styles.inputField} />
-            <TextInput placeholder="This Month Payment (RM)" value={newAmount} onChangeText={(text) => setNewAmount(sanitizeDecimalInput(text))} keyboardType="decimal-pad" style={styles.inputField} />
+            <TextInput accessibilityLabel="Transaction description" placeholder="Detail (e.g. Car Loan)" value={newDetail} onChangeText={setNewDetail} maxLength={100} style={styles.inputField} />
+            <TextInput accessibilityLabel="Transaction amount" placeholder="This Month Payment (RM)" value={newAmount} onChangeText={(text) => setNewAmount(sanitizeDecimalInput(text))} maxLength={14} keyboardType="decimal-pad" style={styles.inputField} />
 
             <Text style={styles.fieldLabel}>Category</Text>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.categoryScroll}>
               {CATEGORIES.map(cat => (
                 <AnimatedPressable
                   key={cat.key}
+                  accessibilityRole="radio"
+                  accessibilityState={{selected: newCategory === cat.key}}
+                  accessibilityLabel={`Category ${cat.label}`}
                   onPress={() => setNewCategory(cat.key)}
                   style={[styles.categoryChip, newCategory === cat.key && styles.categoryChipActive]}
                   scaleTo={0.92}
@@ -1082,6 +1192,8 @@ export default function App() {
             </ScrollView>
 
             <TouchableOpacity
+              accessibilityRole="button"
+              accessibilityLabel="Select transaction date"
               style={styles.datePickerBtn}
               onPress={() => setDatePickerVisible(!datePickerVisible)}
             >
@@ -1099,9 +1211,12 @@ export default function App() {
                     <TouchableOpacity
                       key={day}
                       style={styles.dateCell}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Select day ${day}`}
                       onPress={() => {
                         const formatted = `${day}-${MONTH_MAP[currentMonth.split('-')[1]]}`;
                         setNewDate(formatted);
+                        if (isRepeated || isLoan) setRepeatDay(String(day));
                         setDatePickerVisible(false);
                       }}
                     >
@@ -1114,10 +1229,18 @@ export default function App() {
 
             <View style={{maxHeight: 200}}>
                 <ScrollView keyboardShouldPersistTaps="handled">
-                <View style={styles.checkRow}><TouchableOpacity onPress={() => setIsRepeated(!isRepeated)} style={[styles.checkBox, isRepeated && {backgroundColor: COLORS.primary}]} /><Text>Repeated Monthly?</Text></View>
+                <View style={styles.checkRow}><TouchableOpacity accessibilityRole="checkbox" accessibilityState={{checked: isRepeated}} accessibilityLabel="Repeat monthly" onPress={() => {
+                  const next = !isRepeated;
+                  setIsRepeated(next);
+                  if (next && !repeatDay && newDate) setRepeatDay(String(normalizeDay(newDate.split('-')[0]) ?? ''));
+                }} style={[styles.checkBox, isRepeated && {backgroundColor: COLORS.primary}]} /><Text>Repeated Monthly?</Text></View>
                 {newType === 'expense' && (
                     <>
-                        <View style={styles.checkRow}><TouchableOpacity onPress={() => setIsLoan(!isLoan)} style={[styles.checkBox, isLoan && {backgroundColor: COLORS.dark}]} /><Text>Is Loan?</Text></View>
+                        <View style={styles.checkRow}><TouchableOpacity accessibilityRole="checkbox" accessibilityState={{checked: isLoan}} accessibilityLabel="Mark as loan" onPress={() => {
+                          const next = !isLoan;
+                          setIsLoan(next);
+                          if (next && !repeatDay && newDate) setRepeatDay(String(normalizeDay(newDate.split('-')[0]) ?? ''));
+                        }} style={[styles.checkBox, isLoan && {backgroundColor: COLORS.dark}]} /><Text>Is Loan?</Text></View>
                         {isLoan && (
                             <View style={styles.loanBox}>
                                 <Text style={{fontSize:10, color:COLORS.gray, marginBottom:5}}>Enter Total Debt & Remaining Duration</Text>
@@ -1149,6 +1272,9 @@ export default function App() {
 
                                   <View style={styles.unitToggle}>
                                     <AnimatedPressable
+                                      accessibilityRole="radio"
+                                      accessibilityState={{selected: loanDurationUnit === 'months'}}
+                                      accessibilityLabel="Duration in months"
                                       onPress={() => handleToggleLoanDurationUnit('months')}
                                       style={[styles.unitToggleBtn, loanDurationUnit === 'months' && styles.unitToggleBtnActive]}
                                       scaleTo={0.94}
@@ -1156,6 +1282,9 @@ export default function App() {
                                       <Text style={[styles.unitToggleText, loanDurationUnit === 'months' && styles.unitToggleTextActive]}>Mo</Text>
                                     </AnimatedPressable>
                                     <AnimatedPressable
+                                      accessibilityRole="radio"
+                                      accessibilityState={{selected: loanDurationUnit === 'years'}}
+                                      accessibilityLabel="Duration in years"
                                       onPress={() => handleToggleLoanDurationUnit('years')}
                                       style={[styles.unitToggleBtn, loanDurationUnit === 'years' && styles.unitToggleBtnActive]}
                                       scaleTo={0.94}
@@ -1174,15 +1303,25 @@ export default function App() {
                 )}
                 </ScrollView>
             </View>
+            {saveError ? <Text accessibilityRole="alert" style={styles.formError}>{saveError}</Text> : null}
             <View style={styles.modalBtnRow}>
               <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel="Cancel transaction"
+                disabled={isSaving}
                 onPress={() => {
                   setDatePickerVisible(false);
                   setModalVisible(false);
                 }}
                 style={[styles.modalActionBtn, { backgroundColor: COLORS.gray }]}
               ><Text style={{color:'white'}}>Cancel</Text></TouchableOpacity>
-              <TouchableOpacity onPress={handleSaveItem} style={[styles.modalActionBtn, {backgroundColor: COLORS.primary}]}><Text style={{color:'white'}}>{editingId ? 'Update' : 'Save'}</Text></TouchableOpacity>
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel={editingId ? 'Update transaction' : 'Save transaction'}
+                disabled={isSaving}
+                onPress={handleSaveItem}
+                style={[styles.modalActionBtn, {backgroundColor: COLORS.primary}, isSaving && styles.disabledButton]}
+              ><Text style={{color:'white'}}>{isSaving ? 'Saving…' : editingId ? 'Update' : 'Save'}</Text></TouchableOpacity>
             </View>
           </Pressable>
         </Pressable>
@@ -1354,6 +1493,8 @@ const styles = StyleSheet.create({
   dateNum: { fontSize: 18, fontWeight: 'bold', color: COLORS.dark },
   dateMonth: { fontSize: 10, color: COLORS.gray, textTransform: 'uppercase' },
   detailsBox: { flex: 1 },
+  rowActions: { flexDirection: 'row', alignItems: 'center', marginLeft: 4 },
+  rowActionButton: { padding: 5, borderRadius: 6 },
   itemTitle: { fontSize: 15, fontWeight: '600', color: COLORS.dark, marginBottom: 4 },
   tagsRow: { flexDirection: 'row', gap: 5, flexWrap: 'wrap' },
   tagBlue: { fontSize: 10, color: COLORS.primary, backgroundColor: '#cfe2ff', paddingHorizontal: 6, borderRadius: 4, overflow: 'hidden' },
@@ -1390,5 +1531,7 @@ const styles = StyleSheet.create({
   durationHint: { fontSize: 10, color: COLORS.gray, marginTop: -4, marginBottom: 4 },
   modalBtnRow: { flexDirection: 'row', gap: 10, marginTop: 15 },
   modalActionBtn: { flex: 1, padding: 12, borderRadius: 8, alignItems: 'center' },
+  disabledButton: { opacity: 0.55 },
+  formError: { color: COLORS.danger, fontSize: 12, lineHeight: 17, marginTop: 8 },
   filterBadge: { backgroundColor: COLORS.dark, alignSelf: 'center', paddingHorizontal: 12, paddingVertical: 4, borderRadius: 12, marginTop: 10 },
-}); 
+});

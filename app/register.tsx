@@ -8,7 +8,6 @@ import {
   StyleSheet,
   KeyboardAvoidingView,
   Platform,
-  ActivityIndicator,
 } from "react-native";
 import { registerUser } from "../services/authService";
 import { useRouter } from "expo-router";
@@ -20,6 +19,7 @@ export default function Register() {
   const [isRegistering, setIsRegistering] = useState(false);
 
   const handleRegister = async () => {
+    if (isRegistering) return;
     const cleanEmail = email.trim().toLowerCase();
 
     if (!cleanEmail || !password) {
@@ -115,14 +115,18 @@ export default function Register() {
           <Text style={styles.subtitle}>Join FinancePro today</Text>
 
           <TextInput
+            accessibilityLabel="Email address"
             placeholder="Email"
             placeholderTextColor="#9ca3af"
             style={styles.input}
             onChangeText={setEmail}
             autoCapitalize="none"
+            autoComplete="email"
+            keyboardType="email-address"
           />
 
           <TextInput
+            accessibilityLabel="Password"
             placeholder="Password"
             placeholderTextColor="#9ca3af"
             style={styles.input}
@@ -130,8 +134,8 @@ export default function Register() {
             onChangeText={setPassword}
           />
 
-          <TouchableOpacity style={styles.button} onPress={handleRegister}>
-            <Text style={styles.buttonText}>Register</Text>
+          <TouchableOpacity accessibilityRole="button" accessibilityLabel="Create account" disabled={isRegistering} style={[styles.button, isRegistering && styles.buttonDisabled]} onPress={handleRegister}>
+            <Text style={styles.buttonText}>{isRegistering ? "Creating account…" : "Register"}</Text>
           </TouchableOpacity>
 
           <TouchableOpacity onPress={() => router.push("/login")}>
@@ -211,6 +215,10 @@ const styles = StyleSheet.create({
     padding: 14,
     borderRadius: 12,
     marginTop: 10,
+  },
+
+  buttonDisabled: {
+    opacity: 0.6,
   },
 
   buttonText: {
