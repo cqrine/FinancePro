@@ -8,6 +8,7 @@ import { db } from "../../services/firebase";
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { requestNotificationPermission, scheduleDailyReminder } from "../../services/notificationService";
 import { predictFutureSpending } from "../../services/aiService";
+import FinancialReport from "../../components/FinancialReport";
 import * as Notifications from "expo-notifications";
 import {
   Alert,
@@ -777,6 +778,10 @@ export default function App() {
               <Text style={[styles.statValue, {color: monthStats.balance>=0?COLORS.primary:COLORS.danger}]}>RM {monthStats.balance.toFixed(0)}</Text>
             </View>
         </View>
+
+        <FinancialReport 
+          transactions={items}
+        />
 
         {/* BUDGET SMART ALERT */}
         <View style={styles.budgetCard}>

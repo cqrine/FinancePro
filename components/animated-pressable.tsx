@@ -1,12 +1,13 @@
 import * as Haptics from 'expo-haptics';
 import React from 'react';
 import { GestureResponderEvent, Pressable, PressableProps, StyleProp, ViewStyle } from 'react-native';
+import type { AnimatedStyle } from 'react-native-reanimated';
 import Animated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 
 const AnimatedPressableBase = Animated.createAnimatedComponent(Pressable);
 
 type AnimatedPressableProps = Omit<PressableProps, 'style'> & {
-  style?: StyleProp<ViewStyle>;
+  style?: StyleProp<ViewStyle> | AnimatedStyle<any>;
   /** Scale applied while pressed down. Defaults to a subtle 0.96. */
   scaleTo?: number;
   /** Light haptic tick on press (iOS only, matches HapticTab's convention). */

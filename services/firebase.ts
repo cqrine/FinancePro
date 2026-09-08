@@ -2,6 +2,9 @@ import { initializeApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 
+console.log("Firebase project:", process.env.EXPO_PUBLIC_FIREBASE_PROJECT_ID);
+console.log("Firebase API key exists:", !!process.env.EXPO_PUBLIC_FIREBASE_API_KEY);
+
 const firebaseConfig = {
   apiKey: process.env.EXPO_PUBLIC_FIREBASE_API_KEY,
   authDomain: process.env.EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN,
